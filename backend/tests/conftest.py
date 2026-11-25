@@ -1,8 +1,24 @@
 """Fake LLM so tests run offline and without an API key."""
 
 import pytest
+from datetime import datetime, timezone
 
-from app.agent.state import ParsedWeek, RouteDecision
+from app.agent.state import ParsedWeek, RouteDecision, UnavailableChange
+
+
+@pytest.fixture(autouse=True)
+def scheduler_clock(monkeypatch):
+    """Keep existing whole-week tests independent of the real weekday."""
+    def freeze(instant):
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant.astimezone(tz)
+
+        monkeypatch.setattr("app.agent.tools.scheduler.datetime", FixedDateTime)
+
+    freeze(datetime(2026, 11, 23, 0, tzinfo=timezone.utc))
+    return freeze
 
 
 class FakeStructured:
@@ -34,12 +50,14 @@ def default_parse(prompt: str) -> ParsedWeek:
 
 
 def default_route(prompt: str) -> RouteDecision:
-    return RouteDecision(intent="replan" if "move" in prompt.lower() else "plan_week")
+    return RouteDecision(intent="replan" if any(word in prompt.lower() for word in
+                         ("move", "unavailable")) else "plan_week")
 
 
 @pytest.fixture
 def fake_llm(monkeypatch):
-    llm = FakeLLM({ParsedWeek: default_parse, RouteDecision: default_route})
-    for mod in ("app.agent.router", "app.agent.subgraphs.plan"):
+    llm = FakeLLM({ParsedWeek: default_parse, RouteDecision: default_route,
+                   UnavailableChange: lambda prompt: UnavailableChange()})
+    for mod in ("app.agent.router", "app.agent.subgraphs.plan", "app.agent.subgraphs.replan"):
         monkeypatch.setattr(f"{mod}.get_llm", lambda: llm)
     return llm

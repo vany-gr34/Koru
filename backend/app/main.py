@@ -1,9 +1,9 @@
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Annotated, Literal
 
-from fastapi import FastAPI
-from langgraph.types import Command
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Path as PathParam, Request
+from langgraph.types import Command, Interrupt, StateSnapshot
+from pydantic import BaseModel, Field, StringConstraints
 
 from app.agent.graph import build_graph
 from app.config import settings
@@ -28,30 +28,63 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Weekly Planner Agent", lifespan=lifespan)
 
 
+NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+InterruptKind = Literal["negotiate", "confirm"]
+
+
 class ChatRequest(BaseModel):
-    thread_id: str
-    message: str
-    user_id: str = "demo"
+    thread_id: NonBlank
+    message: NonBlank
+    user_id: NonBlank = "demo"
 
 
 class ResumeRequest(BaseModel):
-    thread_id: str
-    answer: str
+    thread_id: NonBlank
+    answer: NonBlank
+
+
+class PlanBlock(BaseModel):
+    task: str
+    day: int = Field(ge=0, le=6, description="Monday is 0 and Sunday is 6.")
+    start: str
+    end: str
 
 
 class AgentReply(BaseModel):
     status: Literal["needs_input", "done"]
-    kind: str | None = None          # "negotiate" | "confirm" when needs_input
+    kind: InterruptKind | None = None
     message: str
-    plan: list[dict[str, Any]] = []
+    plan: list[PlanBlock] = Field(default_factory=list)
+
+
+class WeekReply(BaseModel):
+    plan: list[PlanBlock] = Field(default_factory=list)
+    approved: bool = False
 
 
 def _to_reply(result: dict) -> AgentReply:
-    if "__interrupt__" in result:
-        payload = result["__interrupt__"][0].value
-        return AgentReply(status="needs_input", kind=payload.get("kind"),
-                          message=payload["message"], plan=payload.get("plan", []))
-    return AgentReply(status="done", message=result.get("response", ""), plan=result.get("plan", []))
+    interrupts = result.get("__interrupt__")
+    if interrupts:
+        payload = interrupts[0].value
+        return AgentReply(
+            status="needs_input",
+            kind=payload["kind"],
+            message=payload["message"],
+            plan=payload.get("plan", []),
+        )
+    return AgentReply(
+        status="done",
+        message=result.get("response", ""),
+        plan=result.get("plan", []),
+    )
+
+
+def _thread_config(thread_id: str) -> dict:
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def _pending_interrupt(snapshot: StateSnapshot) -> Interrupt | None:
+    return next((interrupt for task in snapshot.tasks for interrupt in task.interrupts), None)
 
 
 @app.get("/health")
@@ -60,20 +93,40 @@ async def health():
 
 
 @app.post("/chat", response_model=AgentReply)
-async def chat(req: ChatRequest):
-    config = {"configurable": {"thread_id": req.thread_id}}
-    result = await app.state.graph.ainvoke({"user_input": req.message, "user_id": req.user_id}, config)
+async def chat(req: ChatRequest, request: Request):
+    graph = request.app.state.graph
+    config = _thread_config(req.thread_id)
+    snapshot = await graph.aget_state(config)
+    if _pending_interrupt(snapshot) is not None:
+        raise HTTPException(status_code=409, detail="This thread is waiting for an answer. Use /resume.")
+
+    result = await graph.ainvoke({"user_input": req.message, "user_id": req.user_id}, config)
     return _to_reply(result)
 
 
 @app.post("/resume", response_model=AgentReply)
-async def resume(req: ResumeRequest):
-    config = {"configurable": {"thread_id": req.thread_id}}
-    result = await app.state.graph.ainvoke(Command(resume=req.answer), config)
+async def resume(req: ResumeRequest, request: Request):
+    graph = request.app.state.graph
+    config = _thread_config(req.thread_id)
+    snapshot = await graph.aget_state(config)
+    if snapshot.created_at is None:
+        raise HTTPException(status_code=404, detail="Thread not found.")
+    if _pending_interrupt(snapshot) is None:
+        raise HTTPException(status_code=409, detail="This thread has no pending answer.")
+
+    result = await graph.ainvoke(Command(resume=req.answer), config)
     return _to_reply(result)
 
 
-@app.get("/week/{thread_id}")
-async def week(thread_id: str):
-    snap = await app.state.graph.aget_state({"configurable": {"thread_id": thread_id}})
-    return {"plan": snap.values.get("plan", []), "approved": snap.values.get("approved", False)}
+@app.get("/week/{thread_id}", response_model=WeekReply)
+async def week(request: Request, thread_id: Annotated[NonBlank, PathParam()]):
+    snapshot = await request.app.state.graph.aget_state(_thread_config(thread_id))
+    if snapshot.created_at is None:
+        raise HTTPException(status_code=404, detail="Thread not found.")
+
+    pending = _pending_interrupt(snapshot)
+    if snapshot.values.get("approved"):
+        return WeekReply.model_validate(snapshot.values)
+    if pending is not None:
+        return WeekReply(plan=pending.value["plan"])
+    return WeekReply.model_validate(snapshot.values)

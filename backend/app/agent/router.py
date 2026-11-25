@@ -3,7 +3,8 @@ from app.agent.tools.llm import get_llm
 
 ROUTER_PROMPT = """Classify the user's message about their weekly schedule.
 - plan_week: they describe tasks/deadlines to plan a (new) week
-- replan: they want to change an existing plan (move, cancel, lost time, sick...)
+- replan: they want to change an existing plan, including adding an unavailable/busy window
+  (move, cancel, lost time, sick, 'I'm unavailable Wednesday afternoon'...)
 - review: they ask how their week went / want a summary of what got done
 Has a plan already been made this week? {has_plan}
 

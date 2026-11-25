@@ -73,8 +73,11 @@ def confirm(state: PlannerState) -> Command:
 
 
 def commit(state: PlannerState) -> dict:
-    n = calendar.write_plan(state.get("user_id", "demo"), state["plan"])
-    return {"approved": True, "response": f"Saved {n} sessions to your calendar.\n{format_plan(state['plan'])}"}
+    plan = state["plan"]
+    return {
+        "approved": True,
+        "response": f"Plan approved with {len(plan)} sessions.\n{format_plan(plan)}",
+    }
 
 
 def build_plan_subgraph():

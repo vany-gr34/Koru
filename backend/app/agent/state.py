@@ -30,6 +30,11 @@ class RouteDecision(BaseModel):
     intent: Intent
 
 
+class UnavailableChange(BaseModel):
+    window: Block | None = Field(
+        default=None, description="One new unavailable window, or null for unsupported changes")
+
+
 # ---------- Graph state (shared by the parent graph and all subgraphs) ----------
 class PlannerState(TypedDict, total=False):
     user_id: str
@@ -41,6 +46,8 @@ class PlannerState(TypedDict, total=False):
     tasks: list[dict]
     blocked: list[dict]
     plan: list[dict]
+    proposed_plan: list[dict]
+    proposed_blocked: list[dict]
     unscheduled: list[str]
     approved: bool
     response: str            # final message for the user

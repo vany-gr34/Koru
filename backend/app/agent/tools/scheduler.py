@@ -7,6 +7,8 @@ TODO: daily hour cap, spreading work across days, preferred times, breaks.
 """
 
 import math
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from ortools.sat.python import cp_model
 
@@ -27,18 +29,48 @@ def _to_time(slot_in_day: int, day_start: int) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
+def local_now(prefs: dict) -> datetime:
+    return datetime.now(ZoneInfo(prefs.get("timezone", "Africa/Casablanca")))
+
+
 def solve_schedule(tasks: list[dict], busy: list[dict], prefs: dict,
-                   time_limit_s: float = 10) -> tuple[list[dict], list[str]]:
+                   time_limit_s: float = 10, *, now: datetime | None = None
+                   ) -> tuple[list[dict], list[str]]:
+    """Schedule the current local Monday–Sunday week, excluding elapsed slots.
+
+    ``now`` is an aware instant, injectable for deterministic tests.
+    """
+    timezone = ZoneInfo(prefs.get("timezone", "Africa/Casablanca"))
+    if now is None:
+        now = local_now(prefs)
+    elif now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    now = now.astimezone(timezone)
     day_start, day_end = prefs["day_start"], prefs["day_end"]
     spd = (day_end - day_start) * 60 // SLOT_MIN  # slots per day
+    elapsed_minutes = ((now.hour - day_start) * 60 + now.minute
+                       + now.second / 60 + now.microsecond / 60_000_000)
+    earliest = now.weekday() * spd + math.ceil(
+        max(0, min(elapsed_minutes, spd * SLOT_MIN)) / SLOT_MIN)
     m = cp_model.CpModel()
     intervals, sessions, objective, present_vars = [], [], [], []
 
+    # Busy windows may overlap each other (e.g. a new absence and a calendar event).
+    # Constrain their union, rather than making fixed intervals conflict with each other.
+    occupied = []
     for ev in busy:
         s = _to_slot(ev["day"], ev["start"], day_start, spd)
         e = _to_slot(ev["day"], ev["end"], day_start, spd, ceil=True)
         if e > s:
-            intervals.append(m.NewFixedSizeIntervalVar(s, e - s, "busy"))
+            occupied.append((s, e))
+    merged = []
+    for s, e in sorted(occupied):
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(e, merged[-1][1]))
+        else:
+            merged.append((s, e))
+    for s, e in merged:
+        intervals.append(m.NewFixedSizeIntervalVar(s, e - s, "busy"))
 
     for ti, t in enumerate(tasks):
         present = m.NewBoolVar(f"present_{ti}")
@@ -54,6 +86,7 @@ def solve_schedule(tasks: list[dict], busy: list[dict], prefs: dict,
             offset = m.NewIntVar(0, spd - length, f"off_{ti}_{ci}")
             start = m.NewIntVar(0, 7 * spd, f"start_{ti}_{ci}")
             m.Add(start == day * spd + offset)
+            m.Add(start >= earliest).OnlyEnforceIf(present)
             if prev_end is not None:
                 m.Add(start >= prev_end).OnlyEnforceIf(present)
             prev_end = start + length
